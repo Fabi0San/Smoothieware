@@ -407,14 +407,22 @@ public:
 
     bool set_options(const options_t& options);
 
+    void setTPowerdown(int8_t tpowerdown);
+    void setStealthChopper(bool autoscale, bool symetric, int8_t freewheel, int8_t frequency, int8_t gradient, uint8_t amplitude, uint32_t tpwmthrs);
+    void setStealthChopEnabled(bool enabled);
+
 private:
     bool check_error_status_bits(StreamOutput *stream);
+
+    void setCurrentScaling(uint8_t run_current_scaling, uint8_t hold_current_scaling, uint8_t hold_delay, bool vsense);
+    uint8_t computeCurrentScaling(double mASetting, bool vsense);
 
     // SPI sender
     inline uint32_t send2130(uint8_t reg, uint32_t datagram);
     std::function<int(uint8_t *b, int cnt, uint8_t *r)> spi;
 
     unsigned int resistor{50}; // current sense resistor value in milliohm
+    unsigned char hold_pct{ 70 }; // percentage of run current used for hold
 
     //driver control register copies to easily set & modify the registers
     uint32_t gconf_register_value;
@@ -422,6 +430,9 @@ private:
     uint32_t xdirect_register_value;
     uint32_t chopconf_register_value;
     uint32_t coolconf_register_value;
+    uint32_t tpowerdown_register_value;
+    uint32_t pwmconf_register_value;
+    uint32_t tpwmthrs_register_value;
 
     //SPI status result transferred with each datagram read back
     uint8_t spi_status_result;

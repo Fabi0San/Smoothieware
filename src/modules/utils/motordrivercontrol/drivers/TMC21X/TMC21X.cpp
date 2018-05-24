@@ -39,6 +39,8 @@
 
 #define motor_driver_control_checksum  CHECKSUM("motor_driver_control")
 #define sense_resistor_checksum        CHECKSUM("sense_resistor")
+#define powerdown_percentage           CHECKSUM("powerdown_percentage")
+#define powerdown_wait                 CHECKSUM("powerdown_wait")
 
 //! return value for TMC21X.getOverTemperature() if there is a overtemperature situation in the TMC chip
 /*!
@@ -632,7 +634,9 @@ TMC21X::TMC21X(std::function<int(uint8_t *b, int cnt, uint8_t *r)> spi, char d) 
 void TMC21X::init(uint16_t cs)
 {
     // read chip specific config entries
-    this->resistor= THEKERNEL->config->value(motor_driver_control_checksum, cs, sense_resistor_checksum)->by_default(50)->as_number(); // in milliohms
+    this->resistor= THEKERNEL->config->value(motor_driver_control_checksum, cs, sense_resistor_checksum)->by_default(110)->as_number(); // in milliohms
+    this->hold_pct = THEKERNEL->config->value(motor_driver_control_checksum, cs, powerdown_percentage)->by_default(70)->as_number(); // in pct of run current
+    this->tpowerdown_register_value = THEKERNEL->config->value(motor_driver_control_checksum, cs, powerdown_wait)->by_default(255)->as_number(); // in 
 
     //setting the default register values
     this->gconf_register_value = DEFAULT_DATA;
@@ -640,6 +644,10 @@ void TMC21X::init(uint16_t cs)
     this->xdirect_register_value = DEFAULT_DATA;
     this->chopconf_register_value = DEFAULT_DATA;
     this->coolconf_register_value = DEFAULT_DATA;
+    //this->tpowerdown_register_value = DEFAULT_DATA;
+    this->tpwmthrs_register_value = DEFAULT_DATA;
+
+    //this->setStealthChopper(true, false, 0, 1, 4, 255);
 
     //set the initial values
     send2130(WRITE|GCONF_REGISTER, this->gconf_register_value);
@@ -647,13 +655,18 @@ void TMC21X::init(uint16_t cs)
     send2130(WRITE|XDIRECT_REGISTER, this->xdirect_register_value);
     send2130(WRITE|CHOPCONF_REGISTER, this->chopconf_register_value);
     send2130(WRITE|COOLCONF_REGISTER, this->coolconf_register_value);
+    send2130(WRITE|TPOWERDOWN_REGISTER, this->tpowerdown_register_value);
+    send2130(WRITE|PWMCONF_REGISTER, this->pwmconf_register_value);
+    send2130(WRITE|TPWMTHRS_REGISTER, this->tpwmthrs_register_value);
 
     started = true;
+
+    //setSpreadCycleChopper(4, 36, 4, 0, 0);
 
 
 #if 1
     //set to a conservative start value
-    setConstantOffTimeChopper(7, 54, 13, 12, 1);
+    this->setConstantOffTimeChopper(7, 54, 13, 12, 1);
 #else
     // openbuilds high torque nema23 3amps (2.8)
     setSpreadCycleChopper(5, 36, 6, 0, 0);
@@ -669,7 +682,7 @@ void TMC21X::init(uint16_t cs)
     setMicrosteps(DEFAULT_MICROSTEPPING_VALUE);
 
     // set stallguard to a conservative value so it doesn't trigger immediately
-    setStallGuardThreshold(10, 1);
+    //setStallGuardThreshold(10, 0);
 }
 
 /*
@@ -754,6 +767,27 @@ void TMC21X::setDoubleEdge(int8_t value)
     //if started we directly send it to the motor
     if (started) {
         send2130(WRITE|CHOPCONF_REGISTER, chopconf_register_value);
+    }
+}
+
+void TMC21X::setStealthChopper(bool autoscale, bool symetric, int8_t freewheel, int8_t frequency, int8_t gradient, uint8_t amplitude, uint32_t tpwmthrs)
+{
+    this->gconf_register_value |= GCONF_EN_PWM_MODE;
+    this->tpwmthrs_register_value = tpwmthrs;
+    this->pwmconf_register_value = 0;
+    this->pwmconf_register_value = 
+        (autoscale ? PWMCONF_PWM_AUTOSCALE : 0) |
+        (symetric ? PWMCONF_PWM_SYMMETRIC : 0) |
+        (freewheel << PWMCONF_FREEWHEEL_SHIFT) |
+        (frequency << PWMCONF_PWM_FREQ_SHIFT) |
+        (gradient << PWMCONF_PWM_GRAD_SHIFT) |
+        (amplitude << PWMCONF_PWM_AMPL_SHIFT);
+
+    //if started we directly send it to the motor
+    if (started) {
+        send2130(WRITE|TPWMTHRS_REGISTER, this->tpwmthrs_register_value);
+        send2130(WRITE|GCONF_REGISTER, this->gconf_register_value);
+        send2130(WRITE|PWMCONF_REGISTER, this->pwmconf_register_value);
     }
 }
 
@@ -956,42 +990,82 @@ void TMC21X::setRandomOffTime(int8_t value)
 
 void TMC21X::setCurrent(unsigned int current)
 {
+    //TODO: create settings for this
+    uint8_t hold_delay = 7;
+
+    uint8_t run_current_scaling = computeCurrentScaling((double)current, false);
+
+    //check if the current scaling is too low
+    //set the Vsense bit to get a use half the sense voltage (to support lower motor currents)
+    bool vsense = run_current_scaling < 16;
+    if (vsense)
+    {
+        run_current_scaling = computeCurrentScaling((double)current, vsense);
+    }
+
+    uint8_t hold_current_scaling = computeCurrentScaling((double)(current * this->hold_pct / 100.0F), vsense);
+
+    setCurrentScaling(run_current_scaling, hold_current_scaling, hold_delay, vsense);
+}
+
+void TMC21X::setCurrentScaling(uint8_t run_current_scaling, uint8_t hold_current_scaling, uint8_t hold_delay, bool vsense)
+{
+    if (vsense)
+    {
+        this->chopconf_register_value |= CHOPCONF_VSENSE;
+    }
+    else
+    {
+        this->chopconf_register_value &= ~(CHOPCONF_VSENSE);
+    }
+
+    //delete the old value
+    this->ihold_irun_register_value &= ~(IHOLD_IRUN_IHOLD | IHOLD_IRUN_IRUN | IHOLD_IRUN_IHOLDDELAY);
+
+    //set the new current scaling
+    this->ihold_irun_register_value  |= (
+        (hold_current_scaling << IHOLD_IRUN_IHOLD_SHIFT) |
+        (run_current_scaling << IHOLD_IRUN_IRUN_SHIFT) |
+        (hold_delay << IHOLD_IRUN_IHOLDDELAY_SHIFT));
+
+    //if started we directly send it to the motor
+    if (started) {
+        send2130(WRITE|CHOPCONF_REGISTER, chopconf_register_value);
+        send2130(WRITE|IHOLD_IRUN_REGISTER, ihold_irun_register_value);
+    }
+}
+
+uint8_t TMC21X::computeCurrentScaling(double mASetting, bool vsense)
+{
     uint8_t current_scaling = 0;
     //calculate the current scaling from the max current setting (in mA)
-    double mASetting = (double)current;
-    double resistor_value = (double) this->resistor;
-    // remove vsense flag
-    this->chopconf_register_value &= ~(CHOPCONF_VSENSE);
+    double resistor_value = (double)this->resistor;
     //this is derived from I=(CS+1)/32*(Vsense/Rsense)
     //leading to CS = 32*Rsense*I/Vsense
     //with I = 1000 mA (default)
     //with Rsense = 50 milli Ohm (default)
     //for vsense = 0,32V (VSENSE not set)
     //or vsense = 0,18V (VSENSE set)
-    current_scaling = (uint8_t)(((resistor_value + 20) * mASetting * 32.0F / (0.32F * 1000.0F * 1000.0F)) - 0.5F); //theoretically - 1.0 for better rounding it is 0.5
-    //check if the current scaling is too low
-    if (current_scaling < 16) {
-        //set the Vsense bit to get a use half the sense voltage (to support lower motor currents)
-        this->chopconf_register_value |= CHOPCONF_VSENSE;
-        //and recalculate the current setting
-        current_scaling = (uint8_t)(((resistor_value + 20) * mASetting * 32.0F / (0.18F * 1000.0F * 1000.0F)) - 0.5F); //theoretically - 1.0 for better rounding it is 0.5
-    }
+    current_scaling = (uint8_t)(((resistor_value + 20) * mASetting * 32.0F / ((vsense ? 0.18F : 0.32F) * 1000.0F * 1000.0F)) - 0.5F); //theoretically - 1.0 for better rounding it is 0.5
 
     //do some sanity checks
     if (current_scaling > 31) {
         current_scaling = 31;
     }
 
-    //delete the old value
-    ihold_irun_register_value &= ~(IHOLD_IRUN_IRUN);
-    //set the new current scaling
-    ihold_irun_register_value  |= current_scaling << IHOLD_IRUN_IRUN_SHIFT;
+    return current_scaling;
+}
+
+void TMC21X::setTPowerdown(int8_t tpowerdown)
+{
+    tpowerdown_register_value = tpowerdown;
+
     //if started we directly send it to the motor
     if (started) {
-        send2130(WRITE|CHOPCONF_REGISTER,chopconf_register_value);
-        send2130(WRITE|IHOLD_IRUN_REGISTER,ihold_irun_register_value);
+        send2130(WRITE | TPOWERDOWN_REGISTER, this->tpowerdown_register_value);
     }
 }
+
 
 unsigned int TMC21X::getCurrent(void)
 {
@@ -1087,6 +1161,23 @@ void TMC21X::setCoolStepConfiguration(unsigned int lower_SG_threshold, unsigned 
 
     if (started) {
         send2130(WRITE|COOLCONF_REGISTER,coolconf_register_value);
+    }
+}
+
+void TMC21X::setStealthChopEnabled(bool enabled)
+{
+    if (enabled)
+    {
+        this->gconf_register_value |= GCONF_EN_PWM_MODE;
+    }
+    else
+    {
+        this->gconf_register_value &= ~(GCONF_EN_PWM_MODE);
+    }
+
+    //if started we directly send it to the motor
+    if (started) {
+        send2130(WRITE | GCONF_REGISTER, this->gconf_register_value);
     }
 }
 
@@ -1331,7 +1422,12 @@ void TMC21X::dumpStatus(StreamOutput *stream, bool readable)
         stream->printf(" xdirect register: %08lX(%ld)\n", xdirect_register_value, xdirect_register_value);
         stream->printf(" chopconf register: %08lX(%ld)\n", chopconf_register_value, chopconf_register_value);
         stream->printf(" coolconf register: %08lX(%ld)\n", coolconf_register_value, coolconf_register_value);
-        stream->printf(" motor_driver_control.xxx.reg %05lX,%05lX,%05lX,%05lX,%05lX\n", gconf_register_value, ihold_irun_register_value, xdirect_register_value, chopconf_register_value, coolconf_register_value);
+        stream->printf(" tpowerdown register: %08lX(%ld)\n", tpowerdown_register_value, tpowerdown_register_value);
+        stream->printf(" pwmconf register: %08lX(%ld)\n", pwmconf_register_value, pwmconf_register_value);
+        stream->printf(" tpwmthrs register: %08lX(%ld)\n", tpwmthrs_register_value, tpwmthrs_register_value);
+
+        stream->printf(" motor_driver_control.xxx.reg %05lX,%05lX,%05lX,%05lX,%05lX,%05lX,%05lX,%05lX\n", gconf_register_value, ihold_irun_register_value, xdirect_register_value, chopconf_register_value, coolconf_register_value, tpowerdown_register_value, pwmconf_register_value, tpwmthrs_register_value);
+
 
     } else {
         // TODO hardcoded for X need to select ABC as needed
@@ -1452,6 +1548,10 @@ bool TMC21X::check_error_status_bits(StreamOutput *stream)
         error_reported.reset(5);
     }
 
+    if (!this->isStandStill()) {
+        stream->printf("Stall Guard value: %d         \r", getCurrentStallGuardReading());
+    }
+
     return error;
 }
 
@@ -1471,6 +1571,9 @@ bool TMC21X::setRawRegister(StreamOutput *stream, uint32_t reg, uint32_t val)
             send2130(WRITE|XDIRECT_REGISTER, this->xdirect_register_value);
             send2130(WRITE|CHOPCONF_REGISTER, this->chopconf_register_value);
             send2130(WRITE|COOLCONF_REGISTER, this->coolconf_register_value);
+            send2130(WRITE|TPOWERDOWN_REGISTER, this->tpowerdown_register_value);
+            send2130(WRITE|PWMCONF_REGISTER, this->pwmconf_register_value);
+            send2130(WRITE|TPWMTHRS_REGISTER, this->tpwmthrs_register_value);
             stream->printf("Registers written\n");
             break;
 
@@ -1480,6 +1583,9 @@ bool TMC21X::setRawRegister(StreamOutput *stream, uint32_t reg, uint32_t val)
         case 3: this->xdirect_register_value = val; stream->printf("xdirect register set to %08lX\n", val); break;
         case 4: this->chopconf_register_value = val; stream->printf("chopconf register set to %08lX\n", val); break;
         case 5: this->coolconf_register_value = val; stream->printf("coolconf register set to %08lX\n", val); break;
+        case 6: this->tpowerdown_register_value = val; stream->printf("tpowerdown register set to %08lX\n", val); break;
+        case 7: this->pwmconf_register_value = val; stream->printf("pwmconf register set to %08lX\n", val); break;
+        case 8: this->tpwmthrs_register_value = val; stream->printf("tpwmthrs register set to %08lX\n", val); break;
 
         default:
             stream->printf("1: gconf register\n");
@@ -1487,6 +1593,9 @@ bool TMC21X::setRawRegister(StreamOutput *stream, uint32_t reg, uint32_t val)
             stream->printf("3: xdirect register\n");
             stream->printf("4: chopconf register\n");
             stream->printf("5: coolconf register\n");
+            stream->printf("6: tpowerdown register\n");
+            stream->printf("7: pwmconf register\n");
+            stream->printf("8: tpwmthrs register\n");
             stream->printf("255: update all registers\n");
             return false;
     }
@@ -1558,7 +1667,16 @@ bool TMC21X::set_options(const options_t& options)
         } else if(s == 5 && HAS('Z')) {
             setCoolStepEnabled(GET('Z') == 1);
             set = true;
-        }
+
+        } else if(s == 6 && HAS('Z')) {
+            setStealthChopEnabled(GET('Z') == 1);
+            set = true;
+
+        } else if(s == 7 && HAS('U') && HAS('V') && HAS('W') && HAS('X')) {
+            this->setStealthChopper(true, false, 0, GET('U'), GET('V'), GET('W'), GET('X'));
+            set = true;
+
+      }
     }
 
     return set;
